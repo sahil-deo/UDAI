@@ -1,8 +1,20 @@
 import psycopg2
+import os
+import json
+import google.generativeai as genai
+import hashlib
+import secrets
+
+from psycopg2.extras import RealDictCursor
+from datetime import date
 from fastapi import FastAPI, Request, Response, UploadFile, File
-from app.db import get_conn
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
+from calendar import monthrange
+
+from app.db import get_conn
+from app.custom_json import DecimalEncoder
+
 app = FastAPI()
 
 app.add_middleware(
@@ -13,8 +25,10 @@ app.add_middleware(
     allow_methods=['*'],
 )
 
+agg_cache = {}
 
 @app.get("/filter")
+
 def get_filter(
     request: Request,
     response: Response,
@@ -24,7 +38,8 @@ def get_filter(
     pincode: str | None = None,
     year: str | None = None,
 ):
-
+    if not check_user_loggedin(request):
+        return {'status':'unauthenticated'}
     # normalize empty strings
     state = state or None
     district = district or None
@@ -134,9 +149,71 @@ def get_filter(
         cur.close()
         conn.close()
 
+def get_ai_summary(data):
+    # implement Gemini API summary generation
 
-from calendar import monthrange
-from datetime import timedelta
+
+    # read API key from environment variable
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+    # use free Gemini model
+    # model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    model = genai.GenerativeModel("gemma-3-27b-it")
+
+    # construct prompt with strict word limit
+    prompt = f"""
+    You are an analytics assistant for an Aadhaar operations dashboard.
+
+    You will be given spike analysis results derived from UIDAI datasets.
+    The data includes:
+    - Spike type (Enrollment / Demographic Update / Biometric Update)
+    - State, District, and PIN code
+    - Time period of spike
+    - Whether the spike is sudden, recurring, or seasonal
+    - Age group involved (if available)
+
+    Your task:
+    Generate SHORT, ACTIONABLE, and OPERATIONAL predictions in BULLET POINTS.
+
+    Rules:
+    - Do NOT explain the data.
+    - Do NOT use technical or AI-heavy language.
+    - Each bullet must be a clear recommendation or prediction.
+    - Keep each bullet to 1–2 lines maximum.
+    - Focus on staffing, centers, devices, or workflow decisions.
+
+    Output format (strict):
+    - <Actionable prediction 1>
+    - <Actionable prediction 2>
+    - <Actionable prediction 3>
+
+    Examples of expected output:
+    - Deploy temporary enrollment camps for the next 30 days in this PIN.
+    - Prioritize update-only counters instead of expanding enrollment capacity.
+    - Schedule biometric device recalibration and operator retraining.
+    - Increase staffing during peak weeks to manage recurring spikes.
+    - Shift resources from low-activity districts to high-pressure areas.
+
+    Now generate predictions based ONLY on the spike patterns provided.
+
+    DATA:
+    {json.dumps(data, indent=2, cls=DecimalEncoder)}
+    """
+
+    try:
+        # generate content using Gemini
+        response = model.generate_content(prompt)
+
+        # safely extract text response
+        summary = response.text.strip() if response and response.text else ""
+
+        return summary[:1200]  # hard cap to stay well under 200 words
+
+    except Exception as e:
+        # graceful failure handling\
+        print("Gemini error:", e)
+        return "AI summary could not be generated at this time."
+
 
 @app.get("/data")
 def get_data(
@@ -149,7 +226,8 @@ def get_data(
     year: str | None = None,
     month: str | None = None,
 ):
-
+    if not check_user_loggedin(request):
+        return {'status':'unauthenticated'}
     # normalize empty strings
     state = state or None
     district = district or None
@@ -178,6 +256,9 @@ def get_data(
 
         where_clause = " AND ".join(filters)
 
+        # initialize response dict early
+        response_data = {"status": "ok", "data": {}}
+
         # =========================
         # monthly -> MONTHLY AGG
         # =========================
@@ -187,7 +268,6 @@ def get_data(
                 return {"status": "incomplete request"}
 
             def fetch_yearly(table, columns):
-                # monthly aggregation with zero-fill
                 query = f"""
                     SELECT
                         EXTRACT(MONTH FROM date)::int AS m,
@@ -210,35 +290,30 @@ def get_data(
                         data[c][month_idx] = r[i + 1] or 0
 
                 return {
-                    c: {
-                        "x": list(range(1, 13)),
-                        "y": data[c],
-                    }
+                    c: {"x": list(range(1, 13)), "y": data[c]}
                     for c in columns
                 }
 
-            return {
-                "status": "ok",
-                "data": {
-                    "enrollment": fetch_yearly(
-                        "enrollment_data",
-                        ["age_0_5", "age_5_17", "age_18_greater"],
-                    ),
-                    "biometric": fetch_yearly(
-                        "biometric_data",
-                        ["bio_age_5_17", "bio_age_17_"],
-                    ),
-                    "demographic": fetch_yearly(
-                        "demographic_data",
-                        ["demo_age_5_17", "demo_age_17_"],
-                    ),
-                },
+            # populate dict instead of returning
+            response_data["data"] = {
+                "enrollment": fetch_yearly(
+                    "enrollment_data",
+                    ["age_0_5", "age_5_17", "age_18_greater"],
+                ),
+                "biometric": fetch_yearly(
+                    "biometric_data",
+                    ["bio_age_5_17", "bio_age_17_"],
+                ),
+                "demographic": fetch_yearly(
+                    "demographic_data",
+                    ["demo_age_5_17", "demo_age_17_"],
+                ),
             }
 
         # =========================
         # daily -> DAY OF MONTH
         # =========================
-        if type == "daily":
+        elif type == "daily":
 
             if not (year and month):
                 return {"status": "incomplete request"}
@@ -246,7 +321,6 @@ def get_data(
             days_in_month = monthrange(int(year), int(month))[1]
 
             def fetch_daily(table, columns):
-                # daily aggregation by day-of-month
                 query = f"""
                     SELECT
                         EXTRACT(DAY FROM date)::int AS d,
@@ -274,37 +348,39 @@ def get_data(
                         data[c][day_idx] = r[i + 1] or 0
 
                 return {
-                    c: {
-                        "x": x_axis,
-                        "y": data[c],
-                    }
+                    c: {"x": x_axis, "y": data[c]}
                     for c in columns
                 }
 
-            return {
-                "status": "ok",
-                "data": {
-                    "enrollment": fetch_daily(
-                        "enrollment_data",
-                        ["age_0_5", "age_5_17", "age_18_greater"],
-                    ),
-                    "biometric": fetch_daily(
-                        "biometric_data",
-                        ["bio_age_5_17", "bio_age_17_"],
-                    ),
-                    "demographic": fetch_daily(
-                        "demographic_data",
-                        ["demo_age_5_17", "demo_age_17_"],
-                    ),
-                },
+            # populate dict instead of returning
+            response_data["data"] = {
+                "enrollment": fetch_daily(
+                    "enrollment_data",
+                    ["age_0_5", "age_5_17", "age_18_greater"],
+                ),
+                "biometric": fetch_daily(
+                    "biometric_data",
+                    ["bio_age_5_17", "bio_age_17_"],
+                ),
+                "demographic": fetch_daily(
+                    "demographic_data",
+                    ["demo_age_5_17", "demo_age_17_"],
+                ),
             }
 
-        return {"status": "invalid request"}
+        else:
+            return {"status": "invalid request"}
+
+        # generate AI summary after full data is ready
+        response_data["summary"] = get_ai_summary(response_data["data"])
+
+        # single return point
+        return response_data
 
     finally:
-        # guaranteed DB cleanup
         cur.close()
         conn.close()
+
 
 @app.get("/aggregate")
 def get_aggregate(
@@ -315,9 +391,31 @@ def get_aggregate(
     year: str | None = None,
     month: str | None = None,
 ):
+    if not check_user_loggedin(request):
+        return {'status':'unauthenticated'}
     # basic validation
     if type not in {"yearly", "monthly"}:
         return {"status": "invalid request"}
+
+    if state == None:
+        today_data = None
+        if type == 'yearly':
+            data = agg_cache.get(('yearly', year))  
+            if data is not None:
+                today_data = data.get(date.today)
+                if today_data == None:
+                    del agg_cache[('yearly', year)] 
+            
+        else:            
+            data = agg_cache.get(('monthly', year, month))
+            if data is not None:
+                today_data = data.get(date.today)
+                if today_data == None:
+                    del agg_cache[('monthly', year, month)]
+                    
+        if today_data is not None:
+            return today_data     
+
 
     conn = get_conn()
     cur = conn.cursor()
@@ -431,7 +529,7 @@ def get_aggregate(
                 where = "WHERE EXTRACT(YEAR FROM date) = %s"
                 params = (int(year),)
 
-                return {
+                data = {
                     "status": "ok",
                     "data": {
                         "states": states,
@@ -455,6 +553,11 @@ def get_aggregate(
                         ),
                     },
                 }
+
+
+                agg_cache[('yearly', year)] = {date.today: data}
+                print('Set cache yearly')
+                return data
 
             # ---------------- MONTHLY ----------------
             if type == "monthly":
@@ -467,7 +570,7 @@ def get_aggregate(
                 """
                 params = (int(year), int(month))
 
-                return {
+                data = {
                     "status": "ok",
                     "data": {
                         "states": states,
@@ -491,6 +594,8 @@ def get_aggregate(
                         ),
                     },
                 }
+                agg_cache[('monthly', year, month)] = {date.today : data}
+                return data
 
         return {"status": "invalid request"}
 
@@ -506,6 +611,8 @@ async def upload_csv(
     type: str,
     file: UploadFile = File(...)
 ):
+    if not check_user_loggedin(request):
+        return {'status':'unauthenticated'}
     import pandas as pd
 
     # validate file extension
@@ -598,4 +705,112 @@ async def upload_csv(
         conn.close()
 
     return {"status": "ok"}
+
+
+
+@app.post("/login")
+def login(request: Request, response: Response, username: str, password: str):
+    if check_user_loggedin(request):
+        return {'status':'already loggedin'}
+
+
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        # validate credentials
+        cur.execute(
+            """
+            SELECT username
+            FROM ud_users
+            WHERE username = %s AND password_hash = %s
+            """,
+            (username, password_hash)
+        )
+        user = cur.fetchone()
+
+        if not user:
+            return {"status": "invalid credentials"}
+
+        # generate session token
+        token = secrets.token_urlsafe(32)
+        token_hash = hash_token(token)
+
+        # store hashed token in memory
+        sessions[token_hash] = username
+
+        # set raw token in cookie
+        response.set_cookie(
+            key="token",
+            value=token,
+            httponly=True
+        )
+
+        return {"status": "ok"}
+
+    finally:
+        cur.close()
+        conn.close()
+
+    pass
+
+@app.post("/signup")
+def signup(request: Request, response: Response, username: str, password: str):
+    if check_user_loggedin(request):
+        return {'status':'already loggedin'}
+    
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        # check if user already exists
+        cur.execute(
+            "SELECT 1 FROM ud_users WHERE username = %s",
+            (username,)
+        )
+        if cur.fetchone():
+            return {"status": "user already exists"}
+
+        # hash password before storing
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+
+        cur.execute(
+            """
+            INSERT INTO ud_users (username, password_hash)
+            VALUES (%s, %s)
+            """,
+            (username, password_hash)
+        )
+        conn.commit()
+
+        return {"status": "ok"}
+
+    finally:
+        cur.close()
+        conn.close()
+    
+
+@app.post("/logout")
+def logout(request: Request, response:Response):
+    if not check_user_loggedin(request):
+        return {'status':'already loggedout'}
+
+    del sessions[hash_token(request.cookies.get('token'))]
+    
+    return {'status':'ok'}
+
+sessions = {}
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def check_user_loggedin(request: Request):
+    token = request.cookies.get('token')
+    if token == None:
+        return False
+    
+    token_hash = hash_token(token)
+    return token_hash in sessions
 
